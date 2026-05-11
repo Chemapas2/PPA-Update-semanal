@@ -6,6 +6,7 @@ import unicodedata
 from datetime import date, datetime
 from typing import Any
 from urllib.parse import urljoin
+from pathlib import Path
 
 import fitz  # PyMuPDF
 import pandas as pd
@@ -98,6 +99,9 @@ GENERAL_FIELDS = [
 ]
 
 
+# -------------------------
+# Utilidades
+# -------------------------
 def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").replace("\xa0", " ")).strip()
 
@@ -163,25 +167,6 @@ def split_municipalities(raw_value: str | None) -> list[str]:
     return [part for part in parts if part]
 
 
-def extract_measures(text: str, farms: int | None) -> list[str]:
-    text_lower = strip_accents(text.lower())
-    measures: list[str] = []
-    if "busqueda" in text_lower and "cadaveres" in text_lower and "jabal" in text_lower:
-        measures.append("Búsqueda intensiva de cadáveres de jabalíes y vigilancia reforzada en la zona restringida y su periferia.")
-    if "reduccion de las poblaciones de jabalies" in text_lower or "control poblacional" in text_lower:
-        measures.append("Reducción poblacional de jabalíes mediante trampas de captura y control por agentes rurales/cazadores específicamente formados.")
-    if "vallados" in text_lower or "barreras" in text_lower or "medidas de aislamiento" in text_lower or "cerramientos" in text_lower:
-        measures.append("Refuerzo de vallados, barreras y medidas de aislamiento, priorizando corredores de paso de jabalíes.")
-    if "medidas de bioseguridad" in text_lower:
-        farm_text = f" en {farms} explotaciones comerciales" if farms else " en las explotaciones de porcino"
-        measures.append(f"Inspección de bioseguridad y vigilancia pasiva reforzada{farm_text}.")
-    if "alto nivel de alerta" in text_lower:
-        measures.append("Mantenimiento de un alto nivel de alerta en Cataluña y en el resto de España.")
-    if "obligacion de comunicar" in text_lower:
-        measures.append("Recordatorio de notificación inmediata a los Servicios Veterinarios Oficiales ante cualquier sospecha en jabalíes o porcino doméstico.")
-    return measures
-
-
 def format_date_es(value: date | None) -> str:
     return value.strftime("%d/%m/%Y") if value else "N/D"
 
@@ -193,12 +178,21 @@ def metric_delta(current: int | None, previous: int | None) -> str | None:
     return "0" if delta == 0 else f"{delta:+d}"
 
 
+def has_core_stats(note: dict[str, Any] | None) -> bool:
+    if not note:
+        return False
+    return note.get("total_foci") is not None and note.get("total_positives") is not None
+
+
 def make_session() -> requests.Session:
     session = requests.Session()
     session.headers.update(HEADERS)
     return session
 
 
+# -------------------------
+# Fetch y parseo
+# -------------------------
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_text(url: str) -> str:
     response = make_session().get(url, timeout=30)
@@ -242,18 +236,45 @@ def get_mapa_notes() -> list[dict[str, Any]]:
         href = urljoin(MAPA_NEWS_URL, anchor["href"])
         if not href.lower().endswith(".pdf"):
             continue
+
         title_norm = strip_accents(title.lower())
         href_norm = strip_accents(href.lower())
-        if "peste porcina africana" not in title_norm and "peste-porcina-africana" not in href_norm and "ppa" not in title_norm:
+
+        # Más flexible: aceptar notas de PPA aunque el texto visible no sea perfecto.
+        if not any(k in title_norm or k in href_norm for k in ["peste porcina africana", "ppa", "porcina africana"]):
             continue
         if "catalu" not in title_norm and "catalu" not in href_norm:
             continue
+
         date_match = re.search(r"(\d{2}[./-]\d{2}[./-]\d{4})", title)
         report_date = parse_date_generic(date_match.group(1)) if date_match else None
-        records[href] = {"title": title or href.split("/")[-1], "url": href, "report_date": report_date}
+        records[href] = {
+            "title": title or href.split("/")[-1],
+            "url": href,
+            "report_date": report_date,
+        }
 
     rows = sorted(records.values(), key=lambda row: row["report_date"] or date(1900, 1, 1), reverse=True)
     return rows
+
+
+def extract_measures(text: str, farms: int | None) -> list[str]:
+    text_lower = strip_accents(text.lower())
+    measures: list[str] = []
+    if "busqueda" in text_lower and "cadaveres" in text_lower and "jabal" in text_lower:
+        measures.append("Búsqueda intensiva de cadáveres de jabalíes y vigilancia reforzada en la zona restringida y su periferia.")
+    if "reduccion de las poblaciones de jabalies" in text_lower or "control poblacional" in text_lower:
+        measures.append("Reducción poblacional de jabalíes mediante trampas de captura y control por agentes rurales/cazadores específicamente formados.")
+    if "vallados" in text_lower or "barreras" in text_lower or "medidas de aislamiento" in text_lower or "cerramientos" in text_lower:
+        measures.append("Refuerzo de vallados, barreras y medidas de aislamiento, priorizando corredores de paso de jabalíes.")
+    if "medidas de bioseguridad" in text_lower:
+        farm_text = f" en {farms} explotaciones comerciales" if farms else " en las explotaciones de porcino"
+        measures.append(f"Inspección de bioseguridad y vigilancia pasiva reforzada{farm_text}.")
+    if "alto nivel de alerta" in text_lower:
+        measures.append("Mantenimiento de un alto nivel de alerta en Cataluña y en el resto de España.")
+    if "obligacion de comunicar" in text_lower:
+        measures.append("Recordatorio de notificación inmediata a los Servicios Veterinarios Oficiales ante cualquier sospecha.")
+    return measures
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
@@ -263,7 +284,6 @@ def parse_note(meta: dict[str, Any]) -> dict[str, Any]:
     raw_text = extract_pdf_text(pdf_bytes)
     full_text = normalize_text(raw_text)
 
-    # Fechas: si no se localizan en el PDF, usa la fecha del título/listado.
     date_match = re.search(r"(\d{2}[/.\-]\d{2}[/.\-]\d{4})", full_text)
     note_date = parse_date_generic(date_match.group(1)) if date_match else meta.get("report_date")
 
@@ -300,19 +320,29 @@ def parse_note(meta: dict[str, Any]) -> dict[str, Any]:
         r"las ([\d\.]+) explotaciones comerciales",
         r"([\d\.]+) explotaciones comerciales",
         r"vigilancia pasiva reforzada.*?las ([\d\.]+) explotaciones comerciales",
+        r"inspeccion[aá]ndose.*?las ([\d\.]+) explotaciones comerciales",
     ):
         farms = int_from_match(pattern, full_text)
         if farms is not None:
             break
 
-    municipalities_raw_match = re.search(r"(?:en|de) (\d+) municipios:?\s*(.+?)\s*(?:\(ver mapa 2\)|\.| Además,)", full_text, re.IGNORECASE)
+    municipalities_raw_match = re.search(
+        r"(?:en|de) (\d+) municipios:?\s*(.+?)\s*(?:\(ver mapa 2\)|\. Además,|\.$)",
+        full_text,
+        re.IGNORECASE,
+    )
     municipalities = split_municipalities(municipalities_raw_match.group(2) if municipalities_raw_match else None)
 
-    zone = "Zona restringida II" if re.search(r"zona restringida II", full_text, re.IGNORECASE) else None
+    zone = None
+    if re.search(r"zona restringida II", full_text, re.IGNORECASE):
+        zone = "Zona restringida II"
+    elif re.search(r"zona restringida I", full_text, re.IGNORECASE):
+        zone = "Zona restringida I / II"
+
     domestic_status = None
-    if re.search(r"sin haberse detectado ningún caso positivo en cerdo doméstico", full_text, re.IGNORECASE):
+    if re.search(r"sin haberse detectado ning[uú]n caso positivo en cerdo dom[eé]stico", full_text, re.IGNORECASE):
         domestic_status = "Sin casos positivos en cerdo doméstico"
-    elif re.search(r"sin casos positivos en cerdo doméstico", full_text, re.IGNORECASE):
+    elif re.search(r"sin casos positivos en cerdo dom[eé]stico", full_text, re.IGNORECASE):
         domestic_status = "Sin casos positivos en cerdo doméstico"
 
     measures = extract_measures(full_text, farms)
@@ -342,7 +372,7 @@ def parse_note(meta: dict[str, Any]) -> dict[str, Any]:
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def get_parsed_notes(notes: list[dict[str, Any]], max_items: int = 15) -> list[dict[str, Any]]:
+def get_parsed_notes(notes: list[dict[str, Any]], max_items: int = 20) -> list[dict[str, Any]]:
     parsed: list[dict[str, Any]] = []
     for meta in notes[:max_items]:
         try:
@@ -350,53 +380,66 @@ def get_parsed_notes(notes: list[dict[str, Any]], max_items: int = 15) -> list[d
             item["meta_report_date"] = meta.get("report_date")
             parsed.append(item)
         except Exception:
-            # No detenemos la app por un PDF concreto.
             continue
     parsed.sort(key=lambda row: row.get("report_date") or row.get("meta_report_date") or date(1900, 1, 1), reverse=True)
     return parsed
 
 
-def find_latest_general_note(parsed_notes: list[dict[str, Any]]) -> dict[str, Any] | None:
+def find_latest_core_note(parsed_notes: list[dict[str, Any]]) -> dict[str, Any] | None:
     for note in parsed_notes:
-        if any(note.get(field) not in (None, []) for field in ["total_foci", "total_positives", "negatives_total", "farms"]):
+        if has_core_stats(note):
             return note
     return None
 
 
-def merge_note_with_fallback(latest_note: dict[str, Any], general_note: dict[str, Any] | None, parsed_notes: list[dict[str, Any]]) -> dict[str, Any]:
+def find_latest_support_note(parsed_notes: list[dict[str, Any]], field: str) -> dict[str, Any] | None:
+    for note in parsed_notes:
+        value = note.get(field)
+        if value not in (None, []):
+            return note
+    return None
+
+
+def merge_display_note(latest_note: dict[str, Any], parsed_notes: list[dict[str, Any]]) -> dict[str, Any]:
     merged = dict(latest_note)
+    core_note = find_latest_core_note(parsed_notes)
     merged["using_fallback_stats"] = False
     merged["stats_source_date"] = latest_note.get("report_date")
 
-    if general_note is not None:
-        missing_general = any(merged.get(field) in (None, []) for field in ["total_foci", "total_positives", "negatives_total", "farms"])
-        if missing_general:
-            merged["using_fallback_stats"] = True
-            merged["stats_source_date"] = general_note.get("report_date")
+    # Regla clave: focos totales y positivos totales deben existir siempre.
+    if not has_core_stats(latest_note) and core_note:
+        merged["using_fallback_stats"] = True
+        merged["stats_source_date"] = core_note.get("report_date")
         for field in GENERAL_FIELDS:
             if merged.get(field) in (None, []):
-                fallback_value = general_note.get(field)
+                fallback_value = core_note.get(field)
                 if fallback_value not in (None, []):
                     merged[field] = fallback_value
 
-    comparable_notes = [n for n in parsed_notes if n.get("report_date") != merged.get("stats_source_date") and any(n.get(f) is not None for f in ["total_foci", "total_positives"])]
-    previous_comparable = comparable_notes[0] if comparable_notes else None
-    merged["previous_comparable_note"] = previous_comparable
+    # Para otros campos accesorios, buscar el último valor disponible aunque no esté en la nota núcleo.
+    for field in ["negatives_total", "negatives_captured", "negatives_passive", "farms", "municipalities", "zone", "domestic_status", "measures"]:
+        if merged.get(field) in (None, []):
+            support_note = find_latest_support_note(parsed_notes, field)
+            if support_note and support_note.get(field) not in (None, []):
+                merged[field] = support_note.get(field)
 
-    if merged.get("new_foci") is None and previous_comparable:
-        c = merged.get("total_foci")
-        p = previous_comparable.get("total_foci")
-        if c is not None and p is not None:
-            merged["new_foci"] = c - p
+    # Nota previa comparable para deltas.
+    stats_date = merged.get("stats_source_date")
+    previous_core = None
+    for note in parsed_notes:
+        if note.get("report_date") == stats_date:
+            continue
+        if has_core_stats(note):
+            previous_core = note
+            break
+    merged["previous_comparable_note"] = previous_core
 
-    if merged.get("new_positives") is None and previous_comparable:
-        c = merged.get("total_positives")
-        p = previous_comparable.get("total_positives")
-        if c is not None and p is not None:
-            merged["new_positives"] = c - p
-
-    if merged.get("previous_note_date") is None and previous_comparable:
-        merged["previous_note_date"] = previous_comparable.get("report_date")
+    if merged.get("new_foci") is None and previous_core and merged.get("total_foci") is not None and previous_core.get("total_foci") is not None:
+        merged["new_foci"] = merged["total_foci"] - previous_core["total_foci"]
+    if merged.get("new_positives") is None and previous_core and merged.get("total_positives") is not None and previous_core.get("total_positives") is not None:
+        merged["new_positives"] = merged["total_positives"] - previous_core["total_positives"]
+    if merged.get("previous_note_date") is None and previous_core:
+        merged["previous_note_date"] = previous_core.get("report_date")
 
     return merged
 
@@ -405,6 +448,8 @@ def merge_note_with_fallback(latest_note: dict[str, Any], general_note: dict[str
 def build_history(parsed_notes: list[dict[str, Any]], max_items: int = 12) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for note in parsed_notes[:max_items]:
+        if not has_core_stats(note):
+            continue
         rows.append(
             {
                 "Fecha": note.get("report_date"),
@@ -481,28 +526,11 @@ def get_mercolleida_snapshot() -> dict[str, Any]:
     return result
 
 
-def render_sources(latest_note: dict[str, Any], general_note: dict[str, Any] | None, merco: dict[str, Any]) -> None:
-    with st.sidebar:
-        st.header("Fuentes")
-        st.markdown(f"- [Noticias sanidad animal MAPA]({MAPA_NEWS_URL})")
-        st.markdown(f"- [Ficha PPA MAPA]({MAPA_DISEASE_URL})")
-        st.markdown(f"- [Mercolleida]({MERCOLLEIDA_HOME_URL})")
-        st.markdown(f"- [Cerdo cebado Mercolleida]({MERCOLLEIDA_CERDO_URL})")
-        st.markdown(f"- [Cotizaciones 3tres3]({THREETHREE_PRICES_URL})")
-        st.divider()
-        st.caption(f"Última nota publicada MAPA: {format_date_es(latest_note.get('report_date'))}")
-        if general_note:
-            st.caption(f"Última nota con cifras generales: {format_date_es(general_note.get('report_date'))}")
-        if merco.get("home_date"):
-            st.caption(f"Última fecha mercado ganadero Mercolleida: {format_date_es(merco['home_date'])}")
-        st.caption("La app relee Internet en cada ejecución y cachea resultados 6 horas.")
-
-
-# =========================
+# -------------------------
 # Interfaz
-# =========================
+# -------------------------
 st.title("🐗 Actualización automática PPA España")
-st.caption("Panel Streamlit para Comité de Dirección: cifras clave, mapas oficiales, medidas administrativas y mercado porcino.")
+st.caption("Panel para Comité de Dirección: cifras clave, mapas oficiales, medidas administrativas y mercado porcino.")
 
 col_a, col_b = st.columns([1, 4])
 with col_a:
@@ -510,7 +538,10 @@ with col_a:
         st.cache_data.clear()
         st.rerun()
 with col_b:
-    st.info("La app consulta las fuentes online cada vez que se abre. Si la última nota no trae cifras, mantiene el último consolidado epidemiológico válido.")
+    st.info(
+        "El botón solo vacía la caché y vuelve a leer Internet. "
+        "Si la última nota no trae cifras, la app conserva automáticamente la última nota con focos y positivos."
+    )
 
 try:
     notes = get_mapa_notes()
@@ -522,50 +553,49 @@ if not notes:
     st.error("No se han encontrado notas PDF de PPA en Cataluña en la página del MAPA.")
     st.stop()
 
-parsed_notes = get_parsed_notes(notes, max_items=15)
+parsed_notes = get_parsed_notes(notes, max_items=20)
 if not parsed_notes:
-    st.error("Se localizaron notas, pero no se ha podido procesar ningún PDF del MAPA.")
+    st.error("Se localizaron PDFs, pero no se ha podido procesar ninguno.")
     st.stop()
 
 latest_note = parsed_notes[0]
-general_note = find_latest_general_note(parsed_notes)
-display_note = merge_note_with_fallback(latest_note, general_note, parsed_notes)
+display_note = merge_display_note(latest_note, parsed_notes)
+core_note = find_latest_core_note(parsed_notes)
 previous_note = display_note.get("previous_comparable_note")
-
 merco = get_mercolleida_snapshot()
-render_sources(latest_note, general_note, merco)
+
+with st.sidebar:
+    st.header("Fuentes")
+    st.markdown(f"- [Noticias sanidad animal MAPA]({MAPA_NEWS_URL})")
+    st.markdown(f"- [Ficha PPA MAPA]({MAPA_DISEASE_URL})")
+    st.markdown(f"- [Mercolleida]({MERCOLLEIDA_HOME_URL})")
+    st.caption(f"Última nota publicada MAPA: {format_date_es(latest_note.get('report_date'))}")
+    st.caption(f"Última nota con focos y positivos: {format_date_es(core_note.get('report_date') if core_note else None)}")
+    st.caption("Caché: 6 horas")
+
+if not has_core_stats(display_note):
+    st.error("No se han podido obtener focos totales y positivos totales desde ninguna nota disponible del MAPA.")
+    st.stop()
 
 if display_note.get("using_fallback_stats"):
     st.warning(
-        f"La última nota publicada ({format_date_es(latest_note.get('report_date'))}) no aporta cifras generales suficientes. "
-        f"Se mantienen los últimos datos epidemiológicos consolidados de la nota del {format_date_es(display_note.get('stats_source_date'))}."
+        f"La última nota publicada ({format_date_es(latest_note.get('report_date'))}) no trae cifras generales de focos/positivos. "
+        f"Se muestran las últimas cifras válidas disponibles del {format_date_es(display_note.get('stats_source_date'))}."
     )
 
 st.subheader("Resumen ejecutivo")
 st.markdown(
-    f"**Última nota publicada MAPA:** {format_date_es(latest_note.get('report_date'))}  \\n"
-    f"**Última nota con cifras generales:** {format_date_es(display_note.get('stats_source_date'))}  \\n"
-    f"**Ámbito principal:** {display_note.get('zone') or 'Revisar nota'}  \\n"
+    f"**Última nota publicada MAPA:** {format_date_es(latest_note.get('report_date'))}  \n"
+    f"**Última nota con focos y positivos:** {format_date_es(display_note.get('stats_source_date'))}  \n"
+    f"**Ámbito principal:** {display_note.get('zone') or 'Revisar nota'}  \n"
     f"**Estado en porcino doméstico:** {display_note.get('domestic_status') or 'Revisar nota oficial'}"
 )
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Nuevos focos", display_note.get("new_foci") if display_note.get("new_foci") is not None else "N/D")
-m2.metric(
-    "Nuevos positivos",
-    display_note.get("new_positives") if display_note.get("new_positives") is not None else "N/D",
-    delta=metric_delta(display_note.get("total_positives"), previous_note.get("total_positives") if previous_note else None),
-)
-m3.metric(
-    "Focos totales",
-    display_note.get("total_foci") if display_note.get("total_foci") is not None else "N/D",
-    delta=metric_delta(display_note.get("total_foci"), previous_note.get("total_foci") if previous_note else None),
-)
-m4.metric(
-    "Positivos totales",
-    display_note.get("total_positives") if display_note.get("total_positives") is not None else "N/D",
-    delta=metric_delta(display_note.get("total_positives"), previous_note.get("total_positives") if previous_note else None),
-)
+m2.metric("Nuevos positivos", display_note.get("new_positives") if display_note.get("new_positives") is not None else "N/D")
+m3.metric("Focos totales", display_note.get("total_foci"), delta=metric_delta(display_note.get("total_foci"), previous_note.get("total_foci") if previous_note else None))
+m4.metric("Positivos totales", display_note.get("total_positives"), delta=metric_delta(display_note.get("total_positives"), previous_note.get("total_positives") if previous_note else None))
 
 m5, m6, m7, m8 = st.columns(4)
 m5.metric("Negativos analizados", f"{display_note['negatives_total']:,}".replace(",", ".") if display_note.get("negatives_total") is not None else "N/D")
@@ -577,26 +607,33 @@ if display_note.get("municipalities"):
     st.write("**Municipios con positivos acumulados**")
     st.write(", ".join(display_note["municipalities"]))
 
-with st.expander("Enlace y descarga de la última nota oficial"):
-    st.link_button("Abrir PDF oficial MAPA", latest_note["pdf_url"])
-    st.download_button(
-        "Descargar última nota MAPA",
-        data=latest_note["pdf_bytes"],
-        file_name=f"PPA_MAPA_{format_date_es(latest_note.get('report_date')).replace('/', '')}.pdf",
-        mime="application/pdf",
-    )
+with st.expander("Últimas notas detectadas y control de lectura"):
+    debug_rows = []
+    for note in parsed_notes[:10]:
+        debug_rows.append(
+            {
+                "Fecha": format_date_es(note.get("report_date")),
+                "Focos totales": note.get("total_foci"),
+                "Positivos totales": note.get("total_positives"),
+                "Negativos": note.get("negatives_total"),
+                "Granjas": note.get("farms"),
+                "URL": note.get("pdf_url"),
+            }
+        )
+    st.dataframe(pd.DataFrame(debug_rows), use_container_width=True, hide_index=True)
+    st.link_button("Abrir última nota oficial MAPA", latest_note["pdf_url"])
+
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📍 Cifras y lectura", "🗺️ Mapas", "🛡️ Medidas", "📈 Evolución", "💶 Mercado"])
 
 with tab1:
     left, right = st.columns([1.3, 1])
     with left:
-        st.write("### Lectura rápida")
         bullets = []
         if display_note.get("previous_note_date"):
             bullets.append(f"Comparativa frente a la actualización del {format_date_es(display_note['previous_note_date'])}.")
         if display_note.get("primary_foci") is not None and display_note.get("secondary_foci") is not None:
-            bullets.append(f"Los focos acumulados se desglosan en {display_note['primary_foci']} primarios y {display_note['secondary_foci']} secundarios.")
+            bullets.append(f"Desglose de focos: {display_note['primary_foci']} primarios y {display_note['secondary_foci']} secundarios.")
         if display_note.get("zone"):
             bullets.append(f"Los hallazgos reportados se mantienen en {display_note['zone']}.")
         if display_note.get("domestic_status"):
@@ -606,65 +643,48 @@ with tab1:
         for item in bullets:
             st.markdown(f"- {item}")
 
-        st.write("### Últimas notas detectadas")
-        for note in parsed_notes[:8]:
-            st.markdown(f"- [{format_date_es(note.get('report_date'))}]({note['pdf_url']}) — {note.get('title') or 'Nota oficial'}")
-
     with right:
-        st.write("### Texto base para briefing")
         briefing = []
         if display_note.get("new_foci") is not None:
             briefing.append(f"Nuevos focos: {display_note['new_foci']}")
         if display_note.get("new_positives") is not None:
             briefing.append(f"Nuevos positivos: {display_note['new_positives']}")
-        if display_note.get("total_foci") is not None:
-            briefing.append(f"Focos totales: {display_note['total_foci']}")
-        if display_note.get("total_positives") is not None:
-            briefing.append(f"Positivos acumulados: {display_note['total_positives']}")
+        briefing.append(f"Focos totales: {display_note['total_foci']}")
+        briefing.append(f"Positivos acumulados: {display_note['total_positives']}")
         if display_note.get("negatives_total") is not None:
             briefing.append(f"Negativos analizados: {display_note['negatives_total']:,}".replace(",", "."))
         if display_note.get("domestic_status"):
             briefing.append(display_note["domestic_status"])
-        st.code("\n".join(briefing) if briefing else "Sin datos extraídos", language="text")
+        st.code("\n".join(briefing), language="text")
 
 with tab2:
-    st.write("### Mapas oficiales")
-    map_source = latest_note if latest_note.get("pdf_bytes") else general_note
-    try:
-        st.image(render_pdf_page(map_source["pdf_bytes"], 1), caption="Página 2 del PDF oficial: zonas restringidas y distribución de focos/casos.")
-    except Exception as exc:
-        st.warning(f"No se ha podido renderizar la página 2 del PDF: {exc}")
-    try:
-        st.image(render_pdf_page(map_source["pdf_bytes"], 2), caption="Página 3 del PDF oficial: vallados en puntos de riesgo y medidas en granjas.")
-    except Exception as exc:
-        st.warning(f"No se ha podido renderizar la página 3 del PDF: {exc}")
+    map_source = latest_note if latest_note.get("pdf_bytes") else core_note
+    if map_source:
+        try:
+            st.image(render_pdf_page(map_source["pdf_bytes"], 1), caption="Página 2 del PDF oficial.")
+        except Exception as exc:
+            st.warning(f"No se ha podido renderizar la página 2: {exc}")
+        try:
+            st.image(render_pdf_page(map_source["pdf_bytes"], 2), caption="Página 3 del PDF oficial.")
+        except Exception as exc:
+            st.warning(f"No se ha podido renderizar la página 3: {exc}")
 
 with tab3:
-    st.write("### Medidas que está aplicando la administración")
     if display_note.get("measures"):
         for measure in display_note["measures"]:
             st.markdown(f"- {measure}")
     else:
-        st.warning("No se han podido resumir automáticamente las medidas desde las notas cargadas.")
+        st.warning("No se han podido resumir automáticamente las medidas.")
 
 with tab4:
-    st.write("### Evolución de las últimas notas oficiales")
     history_df = build_history(parsed_notes, max_items=12)
     if history_df.empty:
         st.warning("No se ha podido construir el histórico automático.")
     else:
-        chart_df = history_df.set_index("Fecha")[["Focos totales", "Positivos totales"]]
-        st.line_chart(chart_df)
+        st.line_chart(history_df.set_index("Fecha")[["Focos totales", "Positivos totales"]])
         st.dataframe(history_df.drop(columns=["URL"]), use_container_width=True, hide_index=True)
-        st.download_button(
-            "Descargar histórico CSV",
-            data=history_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name="ppa_historico_mapa.csv",
-            mime="text/csv",
-        )
 
 with tab5:
-    st.write("### Cerdo cebado / Mercolleida")
     k1, k2, k3 = st.columns(3)
     k1.metric("Última fecha ganadero Mercolleida", format_date_es(merco.get("home_date")))
     k2.metric("Detalle cerdo cebado Mercolleida", format_date_es(merco.get("detail_date")))
@@ -678,15 +698,11 @@ with tab5:
             except Exception:
                 delta_text = merco["price_delta"]
         st.metric("Precio Mercolleida (fallback público)", f"{float(merco['price_value']):.3f} €/kg vivo", delta=delta_text)
-        st.caption(f"Fuente pública secundaria: {merco['price_source']} · fecha visible en mercado: {merco.get('price_date') or 'N/D'}")
     else:
         st.warning("No se ha podido recuperar la cotización numérica en esta ejecución.")
 
     if merco.get("comment_text"):
         st.info(f"{format_date_es(merco.get('comment_date'))}: {merco['comment_text']}")
 
-    st.link_button("Abrir Mercolleida", MERCOLLEIDA_HOME_URL)
-    st.link_button("Abrir mercado cerdo cebado Mercolleida", MERCOLLEIDA_CERDO_URL)
-
 st.divider()
-st.caption("Versión robusta: si MAPA publica una nota sin cifras epidemiológicas o cambia parcialmente el formato, la app intenta seguir operativa y conservar el último consolidado válido.")
+st.caption("Versión reforzada: focos totales y positivos totales se toman siempre de la última nota que sí incluya esas cifras, aunque la última publicación sea solo de regionalización.")
